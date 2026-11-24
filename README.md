@@ -34,3 +34,7 @@ python -B -m unittest discover -s tests -v
 - `limits` 可在复投前独立设定浮标的目标半径和绝对偏移限值，缺省为八格和五分钟。版本取该浮标最高值，较早版本留档，同版本由不同事件重报触发冲突。复投锁定该浮标的配置，其他浮标仍可变更。限值只管复投后的数据资格，船班仍按各自声明的空间覆盖和技能运行。
 
 `fixtures/demo.json` 让 `alpha` 占用 `wide` 唯一名额并在复投后获得 `continuous`，`beta` 因缺可执行班次等待。对演示库采入 `fixtures/rejected.json` 会因同泊位窗冲突回滚。采入 `fixtures/late-fix.json` 会使 `alpha` 转为 `hold-position`，而 `--at 67` 仍可单独查询该分钟的定位。`fixtures/drift.json` 用于构造较早的起吊改派反例。
+
+## 便携证据包
+
+`python -B -m evidence_export capture --db lake.sqlite alpha water a6` 导出 `alpha` 在 journal 原件 `water`、`a6` 写入后各自的船班选择、回收状态和连续资格，连同可脱机重放的原始事件。证据包包含到最后一个检查点为止的完整输入前缀，并且不写入源数据库。可以把输出保存为 UTF-8 JSON 并在离线机器上使用 `python -B -m evidence_export verify bundle.json` 验证各检查点；原件顺序来自摄入日志，晚到且晚于所选切点的证据不会改变旧证据包。
