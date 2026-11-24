@@ -1,0 +1,22 @@
+[
+  ["a","buoy","alpha",0,0,"precision"], ["b","buoy","beta",16,0,"precision"],
+  ["e1","equipment","bat-old","battery","alpha"], ["e2","equipment","sen-old","sensor","alpha"],
+  ["e3","equipment","bat-new","battery",null], ["e4","equipment","sen-new","sensor",null],
+  ["a1","fix","alpha","beacon",20,10,0,1], ["a2","fix","alpha","shore",22,11,0,1],
+  ["b1","fix","beta","beacon",22,15,0,1], ["b2","fix","beta","shore",24,16,0,1],
+  ["q1","dock","east-am","east",20,55], ["q2","dock","west-am","west",20,55],
+  ["q3","dock","north-am","north",20,55],
+  ["t1","trip","narrow","east-am","skiff-a",25,53,10,0,4,"precision",1],
+  ["t2","trip","wide","west-am","skiff-b",26,53,10,0,9,"precision",1],
+  ["t3","trip","survey","north-am","skiff-c",27,53,10,0,20,"survey",2],
+  ["book","reserve","alpha","wide"], ["p0","pair","alpha","sen-old",24,25],
+  ["lift","lift","alpha",27], ["land","land","alpha",53],
+  ["swap-b","swap","alpha","bat-old","bat-new",55],
+  ["swap-s","swap","alpha","sen-old","sen-new",56],
+  ["locker-b","transfer","bat-old",56,"deck-crew","locker-keeper"],
+  ["locker-s","transfer","sen-old",57,"deck-crew","locker-keeper"],
+  ["p1","pair","alpha","sen-new",60,62],
+  ["a3","fix","alpha","beacon",65,0,0,1], ["a4","fix","alpha","shore",66,1,0,1],
+  ["water","redeploy","alpha",67],
+  ["a5","fix","alpha","beacon",68,0,0,1], ["a6","fix","alpha","shore",69,1,0,1]
+]

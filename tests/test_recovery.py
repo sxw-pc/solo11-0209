@@ -1,0 +1,308 @@
+import json
+import sqlite3
+import unittest
+from contextlib import closing
+from pathlib import Path
+from tempfile import TemporaryDirectory
+
+import continuity
+import fleet
+import position
+from buoy_recovery import load, snapshot
+from store import connect, one
+
+FIXTURES = Path(__file__).resolve().parents[1] / 'fixtures'
+EVENTS = json.loads((FIXTURES / 'demo.json').read_text(encoding='utf-8'))
+INDEX = {row[0]: i for i, row in enumerate(EVENTS)}
+
+
+class LedgerTest(unittest.TestCase):
+    def setUp(self):
+        self.db = connect(':memory:')
+        self.addCleanup(self.db.close)
+
+    def through(self, event, omit=()):
+        load(self.db, [row for row in EVENTS[:INDEX[event] + 1] if row[0] not in omit])
+
+    def event(self, *args):
+        load(self.db, [list(args)])
+
+    def row(self, event):
+        load(self.db, [EVENTS[INDEX[event]]])
+
+    def qualification(self):
+        return continuity.status(self.db, 'alpha')
+
+
+class PositionTest(LedgerTest):
+    def test_single_reporter_and_stale_evidence(self):
+        self.through('a1')
+        self.event('same-source', 'fix', 'alpha', 'beacon', 21, 11, 0, 1)
+        self.assertEqual(position.envelope(self.db, 'alpha', 21), ('unconfirmed', None))
+        self.row('a2')
+        self.event('old-shore', 'fix', 'alpha', 'shore', 19, 40, 0, 1)
+        self.assertEqual(position.envelope(self.db, 'alpha', 25), ('trusted', (11, 0, 1)))
+        self.assertEqual(position.envelope(self.db, 'alpha', 42), ('unconfirmed', None))
+        self.assertEqual(one(self.db, 'SELECT count(*) FROM fixes'), (4,))
+
+    def test_same_source_minute_conflict_keeps_first_evidence(self):
+        self.through('a2')
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.event('duplicate', 'fix', 'alpha', 'shore', 22, 99, 0, 1)
+        self.assertEqual(one(self.db, "SELECT x FROM fixes WHERE buoy='alpha' AND source='shore' AND minute=22"), (11,))
+        self.assertIsNone(one(self.db, "SELECT 1 FROM journal WHERE id='duplicate'"))
+
+    def test_envelope_includes_measurement_error_and_elapsed_margin(self):
+        self.through('a2')
+        self.assertEqual(position.envelope(self.db, 'alpha', 24), ('trusted', (11, 0, 2)))
+        self.assertEqual(position.envelope(self.db, 'alpha', 25), ('trusted', (11, 0, 3)))
+        self.event('inconsistent', 'fix', 'alpha', 'ranger', 25, 19, 0, 1)
+        self.assertEqual(position.envelope(self.db, 'alpha', 25), ('conflicting', None))
+        self.assertEqual(position.envelope(self.db, 'alpha', 24), ('trusted', (11, 0, 2)))
+
+
+class FleetTest(LedgerTest):
+    def test_trip_requires_dock_open_for_full_interval(self):
+        self.through('q3')
+        with self.assertRaisesRegex(ValueError, 'dock closed'):
+            self.event('outside', 'trip', 'too-late', 'east-am', 'skiff', 25, 56, 10, 0, 4, 'precision', 1)
+        self.event('on-edge', 'trip', 'edge', 'east-am', 'skiff', 20, 55, 10, 0, 4, 'precision', 1)
+        self.assertEqual(one(self.db, 'SELECT id,out,back FROM trips'), ('edge', 20, 55))
+
+    def test_physical_quay_conflict_rolls_back_window(self):
+        self.through('t3')
+        batch = json.loads((FIXTURES / 'rejected.json').read_text(encoding='utf-8'))
+        before = snapshot(self.db)
+        with self.assertRaisesRegex(ValueError, 'quay overlap'):
+            load(self.db, batch)
+        self.assertEqual(snapshot(self.db), before)
+
+    def test_boat_conflict_spans_different_quays(self):
+        self.through('t1')
+        with self.assertRaisesRegex(ValueError, 'boat or quay overlap'):
+            self.event('clash', 'trip', 'same-boat', 'west-am', 'skiff-a', 52, 55, 10, 0, 9, 'precision', 1)
+        self.event('adjacent', 'trip', 'same-boat', 'west-am', 'skiff-a', 53, 55, 10, 0, 9, 'precision', 1)
+        self.assertEqual(one(self.db, "SELECT out FROM trips WHERE id='same-boat'"), (53,))
+
+    def test_assignment_checks_full_envelope_and_maintenance_skill(self):
+        self.through('t3')
+        self.assertEqual(fleet.options(self.db, 'alpha'), ['narrow', 'wide'])
+        self.assertEqual(fleet.options(self.db, 'beta'), ['wide'])
+        for trip in ('narrow', 'survey'):
+            with self.subTest(trip=trip), self.assertRaisesRegex(ValueError, 'trip not feasible'):
+                self.event('bad', 'reserve', 'beta', trip)
+        self.assertEqual(one(self.db, 'SELECT count(*) FROM recoveries'), (0,))
+
+    def test_cancellation_releases_only_selected_reservation(self):
+        self.through('book')
+        self.event('keep-narrow', 'buoy', 'gamma', 0, 0, 'precision')
+        self.event('fix-g1', 'fix', 'gamma', 'beacon', 20, 10, 0, 1)
+        self.event('fix-g2', 'fix', 'gamma', 'shore', 22, 11, 0, 1)
+        self.event('reserve-g', 'reserve', 'gamma', 'narrow')
+        self.assertEqual(fleet.options(self.db, 'beta'), [])
+        self.event('cancel-a', 'cancel', 'alpha')
+        self.assertEqual(fleet.options(self.db, 'beta'), ['wide'])
+        self.assertEqual(self.db.execute('SELECT buoy,trip FROM recoveries').fetchall(), [('gamma', 'narrow')])
+        self.assertEqual(one(self.db, 'SELECT count(*) FROM trips'), (3,))
+
+    def test_late_drift_invalidates_lift_and_allows_reassignment(self):
+        self.through('t3')
+        self.event('r', 'reserve', 'alpha', 'narrow')
+        load(self.db, json.loads((FIXTURES / 'drift.json').read_text(encoding='utf-8')))
+        with self.assertRaisesRegex(ValueError, 'position unqualified'):
+            self.row('lift')
+        self.assertEqual(one(self.db, 'SELECT trip,lifted FROM recoveries'), ('narrow', None))
+        self.event('c', 'cancel', 'alpha')
+        self.row('book')
+        self.row('lift')
+        self.assertEqual(one(self.db, 'SELECT trip,lifted FROM recoveries'), ('wide', 27))
+
+    def test_lifted_reservation_cannot_release_seat(self):
+        self.through('lift')
+        with self.assertRaisesRegex(ValueError, 'no cancellable'):
+            self.event('c', 'cancel', 'alpha')
+        self.assertEqual(fleet.options(self.db, 'beta'), [])
+        self.assertEqual(one(self.db, 'SELECT lifted FROM recoveries'), (27,))
+
+    def test_landing_requires_order_and_trip_deadline(self):
+        self.through('p0')
+        with self.assertRaisesRegex(ValueError, 'prior lift'):
+            self.row('land')
+        self.row('lift')
+        with self.assertRaisesRegex(ValueError, 'outside open trip'):
+            self.event('after-deadline', 'land', 'alpha', 54)
+        self.row('land')
+        self.assertEqual(one(self.db, 'SELECT lifted,landed FROM recoveries'), (27, 53))
+
+
+class CustodyTest(LedgerTest):
+    def test_swap_requires_landing(self):
+        self.through('lift')
+        with self.assertRaisesRegex(ValueError, 'swap before landing'):
+            self.row('swap-b')
+        self.row('land')
+        self.row('swap-b')
+        self.assertEqual(one(self.db, "SELECT buoy,state FROM equipment WHERE id='bat-new'"), ('alpha', 'mounted'))
+        self.assertEqual(one(self.db, "SELECT state FROM equipment WHERE id='bat-old'"), ('deck',))
+
+    def test_swap_batch_durable_rollback_and_same_id_retry(self):
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / 'recovery.sqlite'
+            with closing(connect(path)) as db:
+                load(db, EVENTS[:INDEX['land'] + 1])
+                before = snapshot(db)
+                invalid = ['swap-s', 'swap', 'alpha', 'sen-old', 'bat-new', 56]
+                with self.assertRaisesRegex(ValueError, 'incompatible'):
+                    load(db, [EVENTS[INDEX['swap-b']], invalid])
+            with closing(connect(path)) as reopened:
+                self.assertEqual(snapshot(reopened), before)
+                swaps = EVENTS[INDEX['swap-b']:INDEX['swap-s'] + 1]
+                load(reopened, swaps)
+                committed = snapshot(reopened)
+                load(reopened, swaps)
+                self.assertEqual(snapshot(reopened), committed)
+            with closing(connect(path)) as reopened:
+                self.assertEqual(snapshot(reopened), committed)
+                self.assertEqual(one(reopened, 'SELECT count(*) FROM swaps'), (2,))
+
+    def test_transfer_requires_two_parties_and_event_after_removal(self):
+        self.through('swap-b')
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.event('same', 'transfer', 'bat-old', 56, 'deck', 'deck')
+        with self.assertRaisesRegex(ValueError, 'no removed part'):
+            self.event('early', 'transfer', 'bat-old', 54, 'deck', 'locker')
+        self.row('locker-b')
+        with self.assertRaisesRegex(ValueError, 'no removed part'):
+            self.event('again', 'transfer', 'bat-old', 57, 'other', 'locker')
+        self.assertEqual(one(self.db, 'SELECT sender,receiver,minute FROM transfers'), ('deck-crew', 'locker-keeper', 56))
+        self.assertEqual(one(self.db, "SELECT state FROM equipment WHERE id='bat-old'"), ('locker',))
+
+    def test_custody_as_of_deployment_uses_occurrence_time(self):
+        self.through('a6', omit=('locker-b',))
+        self.assertEqual(self.qualification(), 'hold-custody')
+        self.row('locker-b')
+        self.assertEqual(self.qualification(), 'continuous')
+
+    def test_transfer_after_deployment_cannot_retroactively_clear_hold(self):
+        self.through('a6', omit=('locker-b',))
+        self.event('after', 'transfer', 'bat-old', 68, 'deck', 'locker')
+        self.assertEqual(one(self.db, "SELECT state FROM equipment WHERE id='bat-old'"), ('locker',))
+        self.assertEqual(self.qualification(), 'hold-custody')
+
+
+class ContinuityTest(LedgerTest):
+    def test_clock_pair_is_scoped_to_sensor_and_tenure(self):
+        self.through('swap-s')
+        for buoy, sensor in [('beta', 'sen-new'), ('alpha', 'bat-new')]:
+            with self.subTest(buoy=buoy,sensor=sensor), self.assertRaisesRegex(ValueError, 'requires attached sensor'):
+                self.event('wrong', 'pair', buoy, sensor, 60, 62)
+        for sensor, ref in [('sen-new', 56), ('sen-old', 56)]:
+            with self.subTest(sensor=sensor), self.assertRaisesRegex(ValueError, 'outside sensor tenure'):
+                self.event('boundary', 'pair', 'alpha', sensor, ref, ref)
+        self.row('p1')
+        self.assertEqual(one(self.db, "SELECT ref,local FROM pairs WHERE sensor='sen-new'"), (60, 62))
+
+    def test_clock_uses_latest_in_window_and_rejects_same_time_conflict(self):
+        self.through('a6', omit=('p1',))
+        self.assertEqual(self.qualification(), 'hold-clock')
+        self.row('p1')
+        self.event('old', 'pair', 'alpha', 'sen-new', 59, 120)
+        self.assertEqual(self.qualification(), 'continuous')
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.event('same-ref', 'pair', 'alpha', 'sen-new', 60, 70)
+        self.assertEqual(one(self.db, "SELECT local FROM pairs WHERE sensor='sen-new' AND ref=60"), (62,))
+        self.event('latest', 'pair', 'alpha', 'sen-new', 61, 65)
+        self.assertEqual(self.qualification(), 'hold-clock')
+
+    def test_clock_rejects_agreeing_but_excessive_absolute_offsets(self):
+        self.through('a6', omit=('p0', 'p1'))
+        self.event('old-fast', 'pair', 'alpha', 'sen-old', 25, 31)
+        self.event('new-fast', 'pair', 'alpha', 'sen-new', 60, 66)
+        self.assertEqual(self.qualification(), 'hold-clock')
+
+    def test_clock_reference_gap_is_capped_at_45_minutes(self):
+        self.through('a6', omit=('p0',))
+        self.event('too-far', 'pair', 'alpha', 'sen-old', 14, 15)
+        self.assertEqual(self.qualification(), 'hold-clock')
+        self.event('edge', 'pair', 'alpha', 'sen-old', 15, 16)
+        self.assertEqual(self.qualification(), 'continuous')
+
+    def test_configured_spatial_limit_changes_qualification_only(self):
+        self.through('t3')
+        self.event('small-zone', 'limits', 'alpha', 1, 2, 5)
+        self.assertEqual(fleet.options(self.db, 'alpha'), ['narrow', 'wide'])
+        self.through('a6')
+        self.assertEqual(self.qualification(), 'hold-position')
+
+    def test_configured_absolute_clock_limit_changes_qualification(self):
+        self.through('p1')
+        self.event('strict-offset', 'limits', 'alpha', 1, 8, 1)
+        self.through('a6')
+        self.assertEqual(self.qualification(), 'hold-clock')
+
+    def test_deployment_requires_both_swaps_and_follows_their_times(self):
+        self.through('swap-b')
+        with self.assertRaisesRegex(ValueError, 'requires both swaps'):
+            self.row('water')
+        self.row('swap-s')
+        with self.assertRaisesRegex(ValueError, 'requires both swaps'):
+            self.event('same-time', 'redeploy', 'alpha', 56)
+        self.row('water')
+        self.assertEqual(one(self.db, 'SELECT buoy,minute FROM deployments'), ('alpha', 67))
+
+    def test_return_requires_two_post_deployment_fixes_in_window(self):
+        self.through('water')
+        self.assertEqual(position.envelope(self.db, 'alpha', 67), ('trusted', (1, 0, 2)))
+        self.assertEqual(self.qualification(), 'hold-position')
+        self.row('a5')
+        self.event('after-window', 'fix', 'alpha', 'shore', 78, 30, 0, 1)
+        self.assertEqual(self.qualification(), 'hold-position')
+        self.event('exact-cutoff', 'fix', 'alpha', 'shore', 77, 1, 0, 1)
+        self.assertEqual(self.qualification(), 'continuous')
+
+    def test_late_spatial_conflict_does_not_erase_deployment_or_landing(self):
+        self.through('a6')
+        self.assertEqual(self.qualification(), 'continuous')
+        load(self.db, json.loads((FIXTURES / 'late-fix.json').read_text(encoding='utf-8')))
+        self.assertEqual(self.qualification(), 'hold-position')
+        self.assertEqual(one(self.db, 'SELECT minute FROM deployments'), (67,))
+        self.assertEqual(one(self.db, 'SELECT landed FROM recoveries'), (53,))
+
+    def test_limits_are_buoy_scoped_versioned_and_locked_on_deployment(self):
+        self.through('t3')
+        self.event('alpha-v2', 'limits', 'alpha', 2, 3, 2)
+        self.event('alpha-v1', 'limits', 'alpha', 1, 1, 0)
+        self.event('beta-v2', 'limits', 'beta', 2, 1, 0)
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.event('alpha-same', 'limits', 'alpha', 2, 8, 5)
+        self.assertEqual(continuity.limits(self.db, 'alpha'), (3, 2))
+        self.assertEqual(continuity.limits(self.db, 'beta'), (1, 0))
+        self.assertEqual(fleet.options(self.db, 'beta'), ['wide'])
+        self.through('a6')
+        self.assertEqual(self.qualification(), 'continuous')
+        with self.assertRaisesRegex(ValueError, 'limits locked'):
+            self.event('alpha-v3', 'limits', 'alpha', 3, 1, 0)
+        self.event('beta-v3', 'limits', 'beta', 3, 2, 0)
+        self.assertEqual(continuity.limits(self.db, 'beta'), (2, 0))
+        self.assertEqual(continuity.limits(self.db, 'alpha'), (3, 2))
+
+
+class JournalTest(LedgerTest):
+    def test_journal_conflict_rolls_back_earlier_valid_event_and_retry(self):
+        self.through('a2')
+        before = snapshot(self.db)
+        fix = ['fix-extra', 'fix', 'alpha', 'ranger', 23, 11, 0, 1]
+        with self.assertRaisesRegex(ValueError, 'event id conflict'):
+            load(self.db, [fix, ['a2', 'fix', 'alpha', 'shore', 22, 99, 0, 1]])
+        self.assertEqual(snapshot(self.db), before)
+        load(self.db, [fix])
+        self.assertEqual(one(self.db, "SELECT count(*) FROM journal WHERE id='fix-extra'"), (1,))
+
+    def test_legacy_ledger_replays_with_default_limits_and_no_future_evidence(self):
+        self.through('water')
+        self.db.execute('DROP TABLE qualification_limits')
+        self.assertEqual(continuity.limits(self.db, 'alpha'), (8, 5))
+        self.assertEqual(self.qualification(), 'hold-position')
+        with closing(connect(':memory:')) as rebuilt:
+            load(rebuilt, [json.loads(payload) for payload, in self.db.execute('SELECT payload FROM journal ORDER BY rowid')])
+            self.assertEqual(snapshot(rebuilt), snapshot(self.db))
