@@ -1,0 +1,11 @@
+[
+  ["lk-gamma", "buoy", "gamma", 0, 0, "precision"],
+  ["lk-batch", "packet-batch", "lock-demo", 5],
+  ["lk-catalog", "packet-catalog", "lock-demo", [
+    ["lA", "alpha", 20, "beacon"],
+    ["d1", "gamma", 30, "shore"],
+    ["d2", "gamma", 31, "ranger"]
+  ]],
+  ["lk-p1", "packet-parity", "lk1", "lock-demo", ["lA", "d1", "d2"], "0008000600"],
+  ["lk-p2", "packet-parity", "lk2", "lock-demo", ["d1", "d2"], "0002000601"]
+]

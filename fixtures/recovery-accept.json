@@ -1,0 +1,20 @@
+[
+  ["acc-gamma", "buoy", "gamma", 0, 0, "precision"],
+  ["acc-delta", "buoy", "delta", 0, 0, "precision"],
+  ["acc-batch", "packet-batch", "shore-accept", 5],
+  ["acc-catalog", "packet-catalog", "shore-accept", [
+    ["a1", "alpha", 20, "beacon"],
+    ["b1", "beta", 22, "beacon"],
+    ["m1", "gamma", 20, "shore"],
+    ["m2", "gamma", 21, "ranger"],
+    ["m3", "delta", 20, "shore"],
+    ["m4", "delta", 21, "ranger"],
+    ["r1", "gamma", 22, "beacon"],
+    ["r2", "delta", 22, "beacon"]
+  ]],
+  ["acc-r1", "packet-original", "shore-accept", "r1", "0000000001"],
+  ["acc-r2", "packet-original", "shore-accept", "r2", "0002000001"],
+  ["acc-pc", "packet-parity", "ev-pc", "shore-accept", ["r1", "r2"], "0002000000"],
+  ["acc-pa", "packet-parity", "ev-pa", "shore-accept", ["a1", "m1", "m2"], "0008000600"],
+  ["acc-pb", "packet-parity", "ev-pb", "shore-accept", ["b1", "m3", "m4"], "000d000e00"]
+]

@@ -1,4 +1,4 @@
-from position import distance, envelope
+from position import conflict_note, distance, envelope
 from store import one, require
 
 
@@ -39,8 +39,12 @@ def apply(db, op, args):
         require(row and row[0] <= at <= row[1] and row[7] is None, 'outside open trip')
         _, _, x, y, reach, service, lifted, _ = row
         if op == 'lift':
-            require(lifted is None and eligible(db,buoy,service,x,y,reach,at), 'lift position unqualified')
-            db.execute('UPDATE recoveries SET lifted=? WHERE buoy=?', (at, buoy))
+            # 船班只按当前真正进入 position 取证的报文复核；拼校包从不进 fixes，
+            # 冲突批次的推导行已在 position.rebuild_batch 中撤回。
+            if lifted is None and eligible(db,buoy,service,x,y,reach,at):
+                db.execute('UPDATE recoveries SET lifted=? WHERE buoy=?', (at, buoy))
+            else:
+                require(False, 'lift position unqualified' + conflict_note(db, buoy))
         else:
             require(lifted is not None and lifted <= at, 'land requires prior lift')
             db.execute('UPDATE recoveries SET landed=? WHERE buoy=?', (at, buoy))

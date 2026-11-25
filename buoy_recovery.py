@@ -10,7 +10,8 @@ import fleet
 import position
 from store import connect, has_limits, one, require
 
-GROUPS = {position: 'buoy fix', fleet: 'dock trip reserve cancel lift land',
+GROUPS = {position: 'buoy fix packet-batch packet-catalog packet-original packet-retransmit packet-parity',
+          fleet: 'dock trip reserve cancel lift land',
           custody: 'equipment swap transfer', continuity: 'pair limits redeploy'}
 
 
@@ -38,8 +39,13 @@ def load(db, events):
 
 
 def snapshot(db):
-    tables = 'journal buoys fixes docks trips recoveries equipment swaps transfers pairs deployments'.split()
-    state = {table: db.execute(f'SELECT * FROM {table} ORDER BY rowid').fetchall() for table in tables}
+    tables = ('journal buoys fixes docks trips recoveries equipment swaps transfers pairs deployments '
+              'packet_batches packet_catalog packet_originals packet_parities packet_derived '
+              'packet_conflicts fix_support').split()
+    state = {}
+    for table in tables:
+        present = one(db, "SELECT 1 FROM sqlite_schema WHERE type='table' AND name=?", table)
+        state[table] = db.execute(f'SELECT * FROM {table} ORDER BY rowid').fetchall() if present else []
     state['qualification_limits'] = db.execute('SELECT * FROM qualification_limits ORDER BY rowid').fetchall() if has_limits(db) else []
     return state
 
@@ -50,6 +56,10 @@ def report(db, at):
             'recovery':one(db,'SELECT trip,lifted,landed FROM recoveries WHERE buoy=?',buoy)}))
         if at is not None:
             print(buoy, 'position', json.dumps(position.envelope(db,buoy,at)))
+    batches = one(db, "SELECT 1 FROM sqlite_schema WHERE type='table' AND name='packet_batches'")
+    if batches:
+        for batch, in db.execute('SELECT batch FROM packet_batches ORDER BY batch'):
+            print('packet-batch', batch, json.dumps(position.batch_status(db, batch), ensure_ascii=False, sort_keys=True))
 
 
 def main():
